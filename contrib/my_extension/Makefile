@@ -1,5 +1,5 @@
 MODULE_big = my_extension
-OBJS = my_extension.o rest_server.o http_handle.o
+OBJS = my_extension.o rest_server.o endpoint_handlers.o
 PGFILEDESC = "my_extension with C func"
 
 EXTENSION = my_extension

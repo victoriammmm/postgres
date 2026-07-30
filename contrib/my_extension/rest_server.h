@@ -12,7 +12,7 @@ typedef struct
 
 } Endpoint;
 
-extern void process_rest(void);
+extern void rest_init(void);
 extern void register_endpoint(const char *url, endpoint_handler handler);
 extern void rest_server_poll(void);
 

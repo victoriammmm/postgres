@@ -71,7 +71,7 @@ my_bgworker_main(Datum main_arg)
     register_endpoint("/value/get", handler_get_value);
     register_endpoint("/value/set", handler_post_value);
 
-    process_rest();
+    rest_init();
     
     while(1)
     {
@@ -111,7 +111,6 @@ register_my_bgworker(void)
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
     worker.bgw_restart_time = 5;
-    //worker.bgw_main = my_bgworker_main;
     worker.bgw_main_arg = (Datum) 0;
     snprintf(worker.bgw_library_name, BGW_MAXLEN, "my_extension");
     snprintf(worker.bgw_function_name, BGW_MAXLEN, "my_bgworker_main");
@@ -133,17 +132,13 @@ my_shmem_request(void)
 void
 _PG_init(void)
 {
-    //guc
     DefineCustomIntVariable("my_extension.initial_value",
                             "Initial value for bgworker",
                             "Sets initial value for the bgworker's variable",
                             &my_initial_value, 10, 0, 100,
                             PGC_SIGHUP, 0, NULL, NULL, NULL);
-    
-    //RequestAddinShmemSpace(sizeof(int));
 
     shmem_request_hook = my_shmem_request;
-    //shmem_request_hook = my_shmem_startup;
 
     if (!IsUnderPostmaster)
     {
