@@ -1,0 +1,15 @@
+#include "postgres.h"
+#include "fmgr.h"
+#include "utils/builtins.h"
+
+PG_MODULE_MAGIC;
+
+PG_FUNCTION_INFO_V1(print_hello_c);
+
+Datum
+print_hello_c(PG_FUNCTION_ARGS)
+{
+    char *message = "hello from c";
+    text *result = cstring_to_text(message);
+    PG_RETURN_TEXT_P(result);
+}
