@@ -7,29 +7,22 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <string.h>
-#include <stdbool.h>
 
 #define MAX_ENDPOINTS 100
+#define MAX_CLIENTS 20
 
 extern int *shared_value;
 
 static Endpoint endpoints[MAX_ENDPOINTS];
+static Client clients[MAX_CLIENTS];
+
 static int endpoints_count = 0;
 
 WaitEventSet *event_set = NULL;
 
 static int server_socket = -1;
-static int client_fd = -1;
 
 static bool need_recreate = false;
-
-static char client_response[4096];
-static size_t client_response_len = 0;
-static size_t client_written = 0;
-static bool client_response_ready = false;
-
-static char client_read_buffer[4096];
-static size_t client_read_pos = 0;
 
 void
 register_endpoint(const char *url, endpoint_handler handler)
@@ -47,7 +40,7 @@ rest_init(void)
 {
     if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0)
     {
-        elog(LOG, "process_rest: socket error");
+        elog(LOG, "rest: socket error");
         return;
     }
 
@@ -62,14 +55,14 @@ rest_init(void)
 
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0)
     {
-        elog(LOG, "process_rest: bind error");
+        elog(LOG, "rest: bind error");
         close(server_socket);
         return;
     }
 
     listen(server_socket, 100);
 
-    event_set = CreateWaitEventSet(NULL, 2);
+    event_set = CreateWaitEventSet(NULL, MAX_CLIENTS + 1);
 
     /*проблема: в waiteventset нельзя удалить или изменить fd,
     можно только занулить маску, чтобы больше не было отслеживания за этим fd 
@@ -84,18 +77,41 @@ rest_init(void)
 }
 
 static void
-reset_client(void)
+close_slot(int slot)
 {
-    if (client_fd >= 0){
-        close(client_fd);
+    if (clients[slot].fd >= 0)
+    {
+        close(clients[slot].fd);
     }
-    client_fd = -1;
-    client_response_ready = false;
-    client_written = 0;
-    client_response_len = 0;
+    clients[slot].active = false;
+    clients[slot].fd = -1;
     need_recreate = true;
-    client_read_pos = 0;
-    memset(client_read_buffer, 0, sizeof(client_read_buffer));
+}
+
+int
+find_free_slot(void)
+{
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (!clients[i].active)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int
+find_slot(int fd)
+{
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].active && clients[i].fd == fd)
+        {
+            return i;
+        }
+    }
+    return -1;
 }
 
 void
@@ -106,21 +122,30 @@ rest_server_poll(void)
         return;
     }
 
-    if (need_recreate && client_fd == -1)
+    if (need_recreate)
     {
         FreeWaitEventSet(event_set);
-        event_set = CreateWaitEventSet(NULL, 2);
+        event_set = CreateWaitEventSet(NULL, MAX_CLIENTS + 1);
         AddWaitEventToSet(event_set, WL_SOCKET_READABLE, server_socket, NULL, NULL);
+
+        for (int i = 0; i < MAX_CLIENTS; i++)
+        {
+            if (clients[i].active)
+            {
+                AddWaitEventToSet(event_set, WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE, clients[i].fd, NULL, NULL);
+            }
+        }
+
         need_recreate = false;
     }
 
-    WaitEvent event;
+    WaitEvent events[MAX_CLIENTS + 1];
 
-    int number_of_fd = WaitEventSetWait(event_set, 0, &event, 1, 0);
+    int number_of_fd = WaitEventSetWait(event_set, 0, &events, MAX_CLIENTS + 1, 0);
 
-    if (number_of_fd > 0)
+    for (int i = 0; i < number_of_fd; i++)
     {
-        if ((event.fd == server_socket) && (event.events & WL_SOCKET_READABLE))
+        if ((events[i].fd == server_socket) && (events[i].events & WL_SOCKET_READABLE))
         {
             int client_socket = accept(server_socket, NULL, NULL);
 
@@ -128,72 +153,94 @@ rest_server_poll(void)
             {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                 {
-                    return;
+                    continue;
                 }
-                elog(LOG, "rest_server_poll: accept error");
-                return;
+                elog(LOG, "rest: accept error");
+                continue;
             }
 
-            client_fd = client_socket;
+            int slot = find_free_slot();
 
-            AddWaitEventToSet(event_set, WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE, client_fd, NULL, NULL);
+            if (slot == -1) {
+                elog(LOG, "rest: too many requests, try again later");
+                close(client_socket);
+                continue;
+            }
 
-            client_response_ready = false;
-            client_written = 0;
-            client_response_len = 0;
+            clients[slot].active = true;
+            clients[slot].fd = client_socket;
+            clients[slot].read_pos = 0;
+            clients[slot].response_ready = false;
+            clients[slot].response_len = 0;
+            clients[slot].written = 0;
+            memset(clients[slot].read_buffer, 0, sizeof(clients[slot].read_buffer));
+            memset(clients[slot].response, 0, sizeof(clients[slot].response));
 
-            elog(LOG, "rest_server_poll: new connection accepted fd: %d", client_socket);
+            int client_flags = fcntl(clients[slot].fd, F_GETFL, 0);
+            fcntl(clients[slot].fd, F_SETFL, client_flags | O_NONBLOCK);
+
+            AddWaitEventToSet(event_set, WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE, clients[slot].fd, NULL, NULL);
+
+            elog(LOG, "rest: new connection accepted fd: %d, position: %d", client_socket, slot);
         }
 
-        else if (event.fd == client_fd)
+        else
         {
-            if (event.events & WL_SOCKET_READABLE && !client_response_ready)
+            int slot = find_slot(events[i].fd);
+            if (slot == -1) {
+                elog(LOG, "rest: client not found");
+                continue;
+            }
+
+            Client *client = &clients[slot];
+
+            if (events[i].events & WL_SOCKET_READABLE && !client->response_ready)
             {
-                ssize_t bytes_read = read(client_fd, client_read_buffer + client_read_pos, 
-                                          sizeof(client_read_buffer) - client_read_pos - 1);
+                ssize_t bytes_read = read(client->fd, client->read_buffer + client->read_pos, 
+                                          sizeof(client->read_buffer) - client->read_pos - 1);
                 if (bytes_read < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK)
                     {
-                        return;
+                        continue;
                     }
-                    elog(LOG, "rest_server_poll: read error");
-                    reset_client();
-                    return;
+                    elog(LOG, "rest: read error");
+                    close_slot(slot);
+                    continue;
                 }
                 else if (bytes_read == 0) {
-                    elog(LOG, "rest_server_poll: client closed connection");
-                    reset_client();
-                    return;
+                    elog(LOG, "rest: client closed connection");
+                    close_slot(slot);
+                    continue;
                 }
 
-                client_read_pos += bytes_read;
-                client_read_buffer[client_read_pos] = '\0';
+                client->read_pos += bytes_read;
+                client->read_buffer[client->read_pos] = '\0';
 
-                elog(LOG, "rest_server_poll: read %zd bytes, read %d bytes in total", bytes_read, strlen(client_read_buffer));
+                elog(LOG, "rest: read %zd bytes, read %zu bytes in total", bytes_read, client->read_pos);
 
-                if (strstr(client_read_buffer, "\r\n\r\n") == NULL)
+                if (strstr(client->read_buffer, "\r\n\r\n") == NULL)
                 {
-                    return;
+                    continue;
                 }
 
                 char method[16], url[256];
-                if (sscanf(client_read_buffer, "%15s %255s", method, url) != 2)
+                if (sscanf(client->read_buffer, "%15s %255s", method, url) != 2)
                 {
                     const char *error_body = "Bad request\n";
-                    snprintf(client_response, sizeof(client_response),
+                    snprintf(client->response, sizeof(client->response),
                             "HTTP/1.1 400 Bad Request\r\n"
                             "Content-Type: text/plain\r\n"
                             "Content-Length: %zu\r\n"
                             "\r\n"
                             "%s", strlen(error_body), error_body);
-                    client_response_len = strlen(client_response);
-                    client_written = 0;
-                    client_response_ready = true;
+                    client->response_len = strlen(client->response);
+                    client->written = 0;
+                    client->response_ready = true;
                 }
 
                 else
                 {
-                    char *body = strstr(client_read_buffer, "\r\n\r\n");
+                    char *body = strstr(client->read_buffer, "\r\n\r\n");
                     if (body)
                     {
                         body += 4;
@@ -208,7 +255,7 @@ rest_server_poll(void)
                         {
                             const char *response_body = endpoints[i].handler(method, body, NULL);
 
-                            snprintf(client_response, sizeof(client_response),
+                            snprintf(client->response, sizeof(client->response),
                                     "HTTP/1.1 200 OK\r\n"
                                     "Content-Type: application/json\r\n"
                                     "Content-Length: %zu\r\n"
@@ -227,7 +274,7 @@ rest_server_poll(void)
                                 "-H 'Content-Type: application/json' "
                                 "-d '{\"value\": 300}'\n";
 
-                        snprintf(client_response, sizeof(client_response),
+                        snprintf(client->response, sizeof(client->response),
                                 "HTTP/1.1 404 Not Found\r\n"
                                 "Content-Type: text/plain\r\n"
                                 "Content-Length: %zu\r\n"
@@ -235,34 +282,34 @@ rest_server_poll(void)
                                 "%s", strlen(error_body), error_body);
                     }
 
-                    client_response_len = strlen(client_response);
-                    client_written = 0;
-                    client_response_ready = true;
-                    elog(LOG, "rest_server_poll: response ready (%zu bytes), waiting for write", client_response_len);
+                    client->response_len = strlen(client->response);
+                    client->written = 0;
+                    client->response_ready = true;
+                    elog(LOG, "rest: response ready (%zu bytes), waiting for write", client->response_len);
                 }
             }
 
-            if (event.events & WL_SOCKET_WRITEABLE && client_response_ready)
+            if (events[i].events & WL_SOCKET_WRITEABLE && client->response_ready)
             {
-                size_t remaining = client_response_len - client_written;
+                size_t remaining = client->response_len - client->written;
 
-                ssize_t bytes_written = write(client_fd, client_response + client_written, remaining);
+                ssize_t bytes_written = write(client->fd, client->response + client->written, remaining);
                 if (bytes_written < 0)
                 {
                     if (errno == EAGAIN || errno == EWOULDBLOCK)
                     {
-                        return;
+                        continue;
                     }
-                    elog(LOG, "rest_server_poll: write error");
-                    reset_client();
-                    return;
+                    elog(LOG, "rest: write error");
+                    close_slot(slot);
+                    continue;
                 }
-                client_written += bytes_written;
-                elog(LOG, "rest_server_poll: %zd bytes written, %zu/%zu total", bytes_written, client_written, client_response_len);
+                client->written += bytes_written;
+                elog(LOG, "rest: %zd bytes written, %zu/%zu total", bytes_written, client->written, client->response_len);
 
-                if (client_written >= client_response_len){
-                    elog(LOG, "rest_server_poll: response sent completely");
-                    reset_client();
+                if (client->written >= client->response_len){
+                    elog(LOG, "rest: response sent completely");
+                    close_slot(slot);
                 }
             }
 
